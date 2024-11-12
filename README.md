@@ -1,6 +1,8 @@
 ## What you can find here
 
-This repository is meant as a file storage for the appendix in my software engineering masters thesis: "**Enhancing Grid Middleware Performance Priority Management and Locking Time optimization in JAliEn**". 
+This repository is meant as a file storage for the appendix in my software engineering masters thesis:
+
+> **Enhancing Grid Middleware Performance Priority Management and Locking Time optimization in JAliEn**. 
 
 ---
 
@@ -14,3 +16,7 @@ The ```src/``` folder contains multiple subfolders with related code stored in d
 
 ### Thesis
 The ```thesis/``` folder contains the final PDF of the masters thesis. 
+
+### Legacy
+
+The ```legacy/``` folder contains the code from the legacy Alice Environment (AliEn) that includes the algorithm that was replaced.

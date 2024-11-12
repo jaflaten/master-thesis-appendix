@@ -1,0 +1,510 @@
+package AliEn::Service::Broker::Job;
+
+select(STDERR);
+$| = 1;
+select(STDOUT);
+$| = 1;
+
+use AliEn::Database::TaskQueue;
+
+#use AliEn::TokenManager;
+
+use AliEn::Service::Broker;
+use strict;
+
+
+use AliEn::Util;
+
+use vars qw (@ISA);
+
+push @ISA,"AliEn::Service::Broker";
+use base qw(JSON::RPC::Procedure);
+
+
+use Classad;
+
+my $self = {};
+
+sub initialize {
+	$self = shift;
+	my $options = (shift or {});
+
+	$self->debug(1, "In initialize initializing service TransferBroker");
+
+	$self->{SERVICE} = "Job";
+
+	$self->{DB_MODULE} = "AliEn::Database::TaskQueue";
+
+	$self->forkCheckProcInfo() or return;
+
+	$self->SUPER::initialize($options) or return;
+
+	#srand();
+}
+
+#
+# This function is called when a jobAgent starts, and tries to get a task
+#
+
+sub getJobAgent {
+	my $this           = shift;
+	if ($_[0] and ref $_[0] eq "ARRAY"){
+    my $ref=shift;
+    @_=@$ref;
+  }
+	my $user           = shift;
+	my $host           = shift;
+	my $site_jdl       = shift;
+	my $site_stage_jdl = shift;
+
+	my $date = time;
+
+	#DO NOT PUT ANY print STATEMENTS!!! Otherwise, it doesn't work with an httpd container
+
+	$self->redirectOutput("JobBroker/$host");
+	$self->info("In findjob finding a job for $host");
+
+  $self->info("Before the update");
+	$self->{DB}->updateHost($host, {status => 'ACTIVE', date => $date})
+		or $self->{LOGGER}->error("JobBroker", "In findjob error updating status of host $host")
+		and return;
+  $self->info("Ready to extract params");
+  my ($ok, @info)= $self->getWaitingAgent($site_jdl);
+  my ( $agentid, $queueName, $fileBroker, $remote)= @info;
+#  my ($ok, $agentid, $queueName, $fileBroker, $remote)= $self->getWaitingAgent($site_jdl);
+  $self->info("HELLO $ok, $agentid");
+  if ($ok< 1) {
+    $self->info("We didn't get an agent (@info)");
+    return {execute => [ $ok, @info ]};
+  }
+
+	my ($queueid, $jdl, $jobUser, $resubmission) = $self->{DB}->getWaitingJobForAgentId($agentid, $queueName, $host, $remote);
+	$queueid
+		or $self->info("There were no jobs waiting for agentid!")
+		and return {execute => [ -2, "No jobs waiting in the queue" ]};
+
+        if ($remote){
+          $self->info("This job will be executed on a remote site");
+	  $self->putlog($queueid, "info", "The job will read data remotely");
+        }
+
+	if ($fileBroker) {
+		my $split = $self->{DB}->queryValue("select split from QUEUE where queueid=?", undef, {bind_values => [$queueid]});
+		$split
+			or $self->info("Error getting the masterjob of $queueid, and doing split per file")
+			and return {execute => [ -2, "No jobs waiting in the queue" ]};
+		$self->info("****AND FOR THIS JOB WE HAVE TO CALCULATE THE INPUTDATA");
+		$jdl = $self->findFilesForFileBroker($split, $queueid, $jdl, $queueName);
+		$self->checkMoreFilesForAgent($split);
+		if (!$jdl) {
+			$self->info("In fact, there were no files for this job. Kill it");
+			$self->putlog($queueid, "error", "There were no more files to analyze. Killing the job");
+#			$self->{DB}->updateStatus($queueid, '%', 'KILLED');
+                        $self->{DB}->killProcessInt($queueid, 'admin');
+			return {execute => [ -2, "No jobs waiting in the queue (after fileBroker)" ]};
+
+		}
+
+	}
+	$self->putlog($queueid, "state", "Job state transition from WAITING to ASSIGNED (to $queueName)");
+
+	$self->info("Getting the token");
+	my $token = $self->getJobToken($queueid, $jobUser, $resubmission);
+
+	$self->info("I got as token $token");
+	if ( (!$token) || ($token eq "-1") || (!$token->{jobtoken}) || (!$token->{publicKey}) || (!$token->{privateKey}) ) {
+		$self->{DB}->updateStatus($queueid, "%", "ERROR_A");
+		$self->putlog($queueid, "state", "Job state transition from ASSIGNED to ERRROR_A");
+		$self->info("In requestCommand error getting the token");
+		return -1, "getting the token of the job $queueid";
+	}
+
+	$self->info("Command $queueid sent !");
+	$self->{DB}->setSiteQueueStatus($queueName, "jobagent-match", $site_jdl);
+	return {execute => [ {queueid => $queueid, token => $token->{jobtoken}, tokencert => $token->{publicKey}, tokenkey => $token->{privateKey}, 
+		jdl => $jdl, user => $jobUser, resubmission => $resubmission} ]};
+}
+
+sub getWaitingAgent {
+  my $self= shift;
+  my $site_jdl=shift;
+
+	my ($queueName, $params) = $self->extractClassadParams($site_jdl);
+	$self->info("The extract params worked");
+	$queueName eq '-1' and return (0, $params);
+use Data::Dumper;	
+	$self->info("We have the parameters:" . Dumper($params));
+        $params->{remote}=0;
+
+	$params->{returnId} = 1;
+	my $entry = $self->{DB}->getNumberWaitingForSite($params);
+  $self->info("AND THE ENTRY IS");
+  $self->info(Dumper($entry));	
+	$entry and $entry->{entryId} and 
+	  return 1, $entry->{entryId}, $queueName, $entry->{fileBroker}, 0;
+
+	my $installedPackages=$params->{installedpackages};
+	$self->info("Let's check if we need a package");
+	delete $params->{installedpackages};
+	delete $params->{returnId};
+	$params->{returnPackages} = 1;
+	my $packages = $self->{DB}->getNumberWaitingForSite($params);
+	if ($packages) {
+		$self->info("Telling the site to install packages '$packages'");
+		my @packs = grep (!/\%/, split(",", $packages));
+		$self->info("After removing, we have to install @packs ");
+		$self->{DB}->setSiteQueueStatus($queueName, "jobagent-install-pack", $site_jdl);
+		return  -3, @packs;
+	}
+	$self->info("Now, let's check with remote access");
+	$params->{returnId} = 1;
+	delete $params->{returnPackages};
+	delete $params->{site};
+	delete $params->{extrasites};
+    $params->{remote}=1;
+	$params->{installedpackages}=$installedPackages;
+	$self->info(Dumper($params));
+	$entry = $self->{DB}->getNumberWaitingForSite($params);
+	$self->info(Dumper($entry));
+	($entry) and 
+	 return 1, $entry->{entryId}, $queueName, $entry->{fileBroker}, 1;
+	
+	$self->info("Finally, let's check packages for remote access");
+	delete $params->{installedpackages};
+	delete $params->{returnId};
+	$params->{returnPackages} = 1;
+	 $packages = $self->{DB}->getNumberWaitingForSite($params);
+	if ($packages) {
+		$self->info("Telling the site to install packages '$packages'");
+		my @packs = grep (!/\%/, split(",", $packages));
+		$self->info("After removing, we have to install @packs ");
+		$self->{DB}->setSiteQueueStatus($queueName, "jobagent-install-pack", $site_jdl);
+		return  -3, @packs;
+	}
+	
+	$self->info("In findjob no job to match");
+	$self->{DB}->setSiteQueueStatus($queueName, "jobagent-no-match", $site_jdl);
+	return  -2, "No jobs waiting in the queue" ;
+}
+
+
+
+sub checkMoreFilesForAgent {
+	my $self  = shift;
+	my $split = shift;
+	$self->info("Checking if all the files have been assigned");
+	my $v = $self->{DB}->queryValue("select count(1) from FILES_BROKER where split=? and queueid is null",
+		undef, {bind_values => [$split]});
+	$v and return 1;
+	$self->info("There are no more files to be processed!");
+
+        my $jobs=$self->{DB}->queryColumn("select queueid from QUEUE where statusId=5 and split=?",undef, {bind_values => [$split]});
+        foreach my $job (@$jobs){
+          $self->{DB}->killProcessInt($job, 'admin');
+        }
+#	$self->{DB}->do("UPDATE QUEUE set statusId=-14 where statusId=5 and split=?", {bind_values => [$split]}); # KILLED TO WAITING
+   
+#	$self->{DB}->do("UPDATE ACTIONS set todo=1 where action=='KILLED'");
+
+	return 1;
+}
+
+sub findFilesForFileBroker {
+	my $self    = shift;
+	my $split   = shift;
+	my $queueid = shift;
+	my $jdl     = shift;
+	my $queueName =shift;
+	
+        my @info =split(/\:\:/, $queueName);
+	my $site    = $info[1];
+	
+        my $limit;
+
+        $jdl or $jdl = $self->{DB}->queryValue("select origjdl from QUEUEJDL where queueid=?", undef, {bind_values=>[$split]});
+        $jdl or $self->info("Error getting the jdl of $split while doing the file broker") and return;
+        
+        eval { 
+            my $ca=Classad::Classad->new($jdl) or die("Erorr creating the classad");
+            (my $ok, $limit)=$ca->evaluateAttributeString("SplitMaxInputFileNumber");
+        };
+        if ($@){
+          $self->info("THERE WAS AN ERROR GETTING THE FILE BROKER NUMBER! $@");
+        }
+
+        	
+        $limit or $limit=10; 
+
+
+
+        $self->info("The limit is $limit");
+
+	$site = '%,$site,%';
+
+	$self->info(
+"UPDATE FILES_BROKER set queueid=? where queueid is null and split=? and sites like ? limit $limit and $queueid,$split, $site"
+	);
+	my $done =
+		$self->{DB}->do("UPDATE FILES_BROKER set queueid=? where queueid is null and split=? and sites like ? limit $limit",
+		{bind_values => [ $queueid, $split, $site ]});
+
+	$self->info("WE HAVE $done files");
+
+	if ($done < $limit) {
+		$self->info("We didn't get enough files. Asking to read remotely");
+		my $done2 =
+			$self->{DB}->do("UPDATE FILES_BROKER set queueid=? where queueid is null and split=? limit " . ($limit - $done),
+			{bind_values => [ $queueid, $split ]});
+		$self->info("And now we have $done2");
+		if (!$done2) {
+			$self->info("There are no more files to process");
+			return;
+		}
+	}
+
+	my $files =
+		$self->{DB}->queryColumn("SELECT lfn from FILES_BROKER where queueid=?", undef, {bind_values => [$queueid]});
+	$files or $self->info("Error retrieving the list of files") and return;
+	my $inputdata = 'inputdata= {"' . join('","', @$files) . '"};';
+
+	$jdl =~ s/;/;$inputdata/;
+
+	$self->info("AND THE JDL is $jdl. Updating the JDL");
+        $self->{DB}->do("update QUEUEJDL set origjdl=? where queueid=?",  {bind_values=>[$queueid]});
+
+
+	return $jdl;
+
+}
+
+sub checkQueueOpen {
+	my $self       = shift;
+	my $site_ca    = shift;
+	my $queue_name = shift;
+	if (!$queue_name) {
+		(my $ok, $queue_name) = $site_ca->evaluateAttributeString("CE");
+		if (!$queue_name) {
+			$self->info("Error getting the queue name from the classad");
+			return ("", "Error getting the queue name from the classad");
+		}
+	}
+	my $open = $self->{DB}->queryValue("select count(*) from SITEQUEUES where blocked='open' and site='$queue_name'");
+	if (!$open) {
+		$self->{DB}->setSiteQueueStatus($queue_name, "closed-blocked", $site_ca->asJDL());
+		return ("", "The queue is locked ");
+	}
+	return (1, "");
+}
+
+# ***************************************************************
+# Creates a new token randomly. Always 32 caracters long.
+# ***************************************************************
+my $createToken = sub {
+	srand();
+        my $token = "";
+	my @Array = (
+		'X', 'Q', 't', '2', '!', '^', '9', '5', '3', '4', '5', 'o', 'r', 't', '{', ')', '}', '[',
+		']', 'h', '9', '|', 'm', 'n', 'b', 'v', 'c', 'x', 'z', 'a', 's', 'd', 'f', 'g', 'h', 'j',
+		'k', 'l', ':', 'p', 'o', 'i', 'u', 'y', 'Q', 'W', 'E', 'R', 'T', 'Y', 'U', 'I', 'O', 'P',
+		'A', 'S', 'D', 'F', 'G', 'H', 'J', 'Z', 'X', 'C', 'V', 'B', 'N', 'M'
+	);
+	my $i;
+	for ($i = 0 ; $i < 32 ; $i++) {
+		$token .= $Array[ rand(@Array) ];
+	}
+	return $token;
+};
+
+sub getToken {
+    my $self = shift;
+    my $procid = shift;
+	my $user   = shift;
+	my $rm     = shift;
+	my $tokenh;
+    
+    if (!$self->{CONFIG}->{TOKEN_GENERATOR_ADDRESS}) {
+      $self->info("Warning: we want to ask the token generator service, but we don't know its address...");
+      $tokenh->{jobtoken} = $createToken->();
+      $tokenh->{publicKey} = "undef";
+      $tokenh->{privateKey} = "undef";
+      return $tokenh;
+    }
+    
+    my $tokenurl = "$self->{CONFIG}->{TOKEN_GENERATOR_ADDRESS}?queueId=".$procid."&username=".$user."&resubmission=".$rm;
+    my ($ok, @value) = AliEn::Util::getURLandEvaluate($tokenurl, 1);
+    if ($ok) {
+      $self->info("Returning the value from the TokenGenerator '$value[0]->{'token'}'");
+      
+      $tokenh->{jobtoken} = $value[0]->{'token'};
+      $tokenh->{publicKey} = $value[0]->{'publicKey'};
+      $tokenh->{privateKey} = $value[0]->{'privateKey'};
+      return $tokenh;
+    }
+    $self->info("Warning: The TokenGenerator didn't return any value");
+
+    $tokenh->{jobtoken} = $createToken->();
+    $tokenh->{publicKey} = "undef";
+    $tokenh->{privateKey} = "undef";
+    return $tokenh;
+}
+
+sub getJobToken {
+	my $self   = shift;
+	my $procid = shift;
+	my $user   = shift;
+	my $rm     = shift;
+
+	$self->info("Getting  job $procid (and $user)");
+
+	($procid)
+		or $self->info("Error: In getJobToken not enough arguments") 
+		and return;
+
+	$self->{DB}->queryValue("select count(*) from JOBTOKEN where jobId=?", undef, {bind_values => [$procid]}) 
+		and $self->info("Job $procid already given..") 
+		and return;
+
+    my $token;
+    $token = $self->getToken($procid, $user, $rm);
+
+	$self->{DB}->insertJobToken($procid, $user, $token->{jobtoken})
+		or $self->info("Error updating jobToken for user $user and jobid $procid (token $token) !") 
+		and return (-1, "error setting the job token");
+
+	$self->info("Sending job $procid to $user");
+	return $token;
+}
+
+# Checks if there are any agents needed that fulfill the requirements
+# It returns an array of arrays of jobagents and requirements.
+#
+
+sub extractClassadParams {
+	my $self    = shift;
+	my $ca_text = shift;
+	my $params  = {};
+
+	$self->debug(1, "Creating the classad");
+	my $classad = Classad::Classad->new($ca_text);
+	$self->debug(1, "Classad created");
+
+	my ($ok, $queueName) = $classad->evaluateAttributeString("CE");
+	my @jobAgents;
+	($ok, my $msg) = $self->checkQueueOpen($classad, $queueName);
+	$ok or return (-1, $msg);
+	$params->{site} = "";
+	$queueName =~ /::(.*)::/ and $params->{site} = $1;
+        ($ok, my @closese) = $classad->evaluateAttributeVectorString("CloseSE");
+        $ok and $params->{extrasites}="";
+	foreach my $se (@closese) {
+		$se =~ /::(.*)::/ and $params->{site}!~$1 and $params->{extrasites}.="$1,";
+	}
+        $params->{extrasites}=~s/,$//;
+    ($ok, my $ttl) = $classad->evaluateAttributeInt("TTL");
+	$params->{ttl} = $ttl || 84000;
+	($ok, $params->{disk}) = $classad->evaluateExpression("LocalDiskSpace");
+	($ok, my @pack) = $classad->evaluateAttributeVectorString("Packages");
+	$params->{packages} = "," . join(",,", sort @pack) . ",";
+	($ok, @pack) = $classad->evaluateAttributeVectorString("InstalledPackages");
+	$params->{installedpackages} = "," . join(",,", sort @pack) . ",";
+	($ok, @pack) = $classad->evaluateAttributeVectorString("GridPartitions");
+      $self->info("AND THE PARTITION @pack");
+	$params->{partition} = "," . join(",", sort @pack) . ",";
+	$params->{ce}        = $queueName;
+
+	($ok, $params->{splitFiles})= $classad->evaluateAttributeString("SplitMaxInputFileNumber");
+
+    ($ok, my $reqs) = $classad->evaluateExpression("Requirements");
+    while ($reqs =~ s/\s*other.user\s*==\s*"([^"]*)"//i) {
+      $params->{cerequirements_users}.="".$self->{DB}->getOrInsertFromLookupTable('user',$1).",";
+    }
+    $params->{cerequirements_users} and $params->{cerequirements_users} =~ s/,$//g;
+    
+    while ($reqs =~ s/\s*other.user\s*!=\s*"([^"]*)"//i) {
+      $params->{cerequirements_nousers}.="".$self->{DB}->getOrInsertFromLookupTable('user',$1).",";
+    }
+    $params->{cerequirements_nousers} and $params->{cerequirements_nousers} =~ s/,$//g;
+        
+    ($ok, my $cvmfs) = $classad->evaluateExpression("CVMFS");
+    $ok and $cvmfs and $params->{cvmfs}=1;
+    
+    ($ok, my $cvmfsrev) = $classad->evaluateExpression("CVMFS_Revision");
+    $ok and $cvmfsrev and $params->{cvmfs_revision}=$cvmfsrev;
+
+	return ($queueName, $params);
+}
+
+sub offerAgent : Public{
+	shift;
+  if ($_[0] and ref $_[0] eq "ARRAY"){
+    my $ref=shift;
+    @_=@$ref;
+  }
+	my $user       = shift;
+	my $host       = shift;
+	my $ca_text    = shift;
+	my $free_slots = (shift or 0);
+
+	$self->redirectOutput("JobBroker/$host");
+	$self->info(
+		"And now Checking if there are any agents that can be started in the machine $host (up to a maximum of $free_slots)"
+	);
+
+	$free_slots
+		or $self->info("Not enough resources")
+		and return (-1, "Not enough resources");
+        $self->info("THE CLASSAD IS $ca_text");
+	my ($queueName, $params) = $self->extractClassadParams($ca_text);
+	$queueName eq '-1' and return $queueName, $params;
+
+	delete $params->{installedpackages};
+	my $waiting = $self->{DB}->getNumberWaitingForSite($params);
+        
+        $waiting or $waiting=0;
+	$self->info("We could run $waiting jobs there");
+	$waiting > $free_slots and $waiting = $free_slots;
+	if ($waiting) {
+		$self->info("Telling the site to start $waiting job agents");
+		$self->{DB}->setSiteQueueStatus($queueName, "open-matching", $ca_text);
+		return [ $waiting, '[Type="Job";Requirements = other.Type == "machine" ]' ];
+	}
+	return -2;
+}
+
+sub putlog {
+	my $self    = shift;
+	my $queueId = shift;
+	my $status  = shift;
+	my $message = shift;
+	return $self->{DB}->insertJobMessage($queueId, $status, $message, 0);
+}
+
+sub invoke {
+	my $other = shift;
+	my $op    = shift;
+
+	$self->info("$$ Ready to do a task operation (and $op '@_')");
+
+	my $mydebug = $self->{LOGGER}->getDebugLevel();
+	my $params  = [];
+
+	(my $debug, $params) = AliEn::Util::getDebugLevelFromParameters(@_);
+	$debug and $self->{LOGGER}->debugOn($debug);
+	$self->{LOGGER}->keepAllMessages();
+
+	#  $op = "$self->{TASK_DB}->".$op;
+	my @info = $self->{DB}->$op(@_);
+
+	my @loglist = @{$self->{LOGGER}->getMessages()};
+
+	$debug and $self->{LOGGER}->debugOn($mydebug);
+	$self->{LOGGER}->displayMessages();
+	$self->info("$$ invoke DONE with OP: $op (and @_)");    #, rc = $rc");
+	$self->info("$$ invoke result: @info" . scalar(@info));
+	return {                                                #rc=>$rc,
+		rcvalues   => \@info,
+		rcmessages => \@loglist
+	};
+}
+
+1;
